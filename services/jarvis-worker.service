@@ -1,0 +1,21 @@
+[Unit]
+Description=Jarvis laptop worker
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace YOUR_USERNAME everywhere. Use `id -u` for the UID in the D-Bus path (1000 is typical).
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/jarvis-worker
+ExecStart=/home/YOUR_USERNAME/jarvis-worker/venv/bin/python worker.py
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/YOUR_USERNAME/.Xauthority
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+# Not sandboxed with ProtectHome/NoNewPrivileges on purpose: the worker must launch GUI apps
+# and call systemctl suspend/poweroff. Its protection is the allowlist + Tailscale-only bind.
+
+[Install]
+WantedBy=multi-user.target

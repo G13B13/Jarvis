@@ -1,0 +1,7 @@
+# Brain host (runs Jarvis_brain.py)
+discord.py==2.7.1
+openai==3.42.0
+requests==2.34.2
+python-dotenv==1.2.4
+APScheduler==3.11.3
+faster-whisper==1.2.1   # optional: voice messages. Also needs `apt install ffmpeg`

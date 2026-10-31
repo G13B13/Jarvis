@@ -1,0 +1,25 @@
+[Unit]
+Description=Jarvis brain (Discord bot)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jarvis
+Group=jarvis
+WorkingDirectory=/opt/jarvis
+ExecStart=/opt/jarvis/venv/bin/python /opt/jarvis/Jarvis_brain.py
+Restart=on-failure
+RestartSec=10
+# Whisper model cache lives inside the writable dir (ProtectHome blocks ~/.cache)
+Environment=HF_HOME=/opt/jarvis/.cache
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/jarvis
+
+[Install]
+WantedBy=multi-user.target
