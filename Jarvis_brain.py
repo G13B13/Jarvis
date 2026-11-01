@@ -7,11 +7,14 @@ import re
 import asyncio
 import datetime
 from reminders import init_db, add_reminder, get_due_reminders, delete_reminder, parse_time
+import memory_store
+from confirmation import resolve as resolve_confirmation
 import random
 import json
 import tempfile
 import os
 import subprocess
+import time
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -36,8 +39,11 @@ ROBOT_URL = os.getenv("ROBOT_URL")
 YOUR_DISCORD_USER_ID = int(os.getenv("YOUR_DISCORD_USER_ID"))
 # =========================
 
-conversation_history = {}
-DAILY_MEMORY = ""
+MEMORY_PATH = os.getenv("MEMORY_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory.json"))
+_saved = memory_store.load(MEMORY_PATH)
+conversation_history = _saved["history"]
+DAILY_MEMORY = _saved["daily_memory"]
+SUMMARIZED_AT = _saved["summarized_at"]
 pending_confirmations = {}
 alert_cooldowns = {}
 
@@ -176,6 +182,13 @@ async def reminder_checker():
             delete_reminder(rem_id)
         await asyncio.sleep(60)
 
+def persist_memory():
+    """Save chat memory to disk. Never lets a disk problem break a reply."""
+    try:
+        memory_store.save(MEMORY_PATH, conversation_history, DAILY_MEMORY, SUMMARIZED_AT)
+    except Exception as e:
+        print(f"⚠️ Could not save memory: {e}")
+
 def build_messages(user_id, user_input):
     sp = ("You are Jarvis, a helpful personal assistant. You can control the user's laptop, "
           "search the web, check laptop status, take screenshots, get weather, set reminders, "
@@ -292,6 +305,7 @@ async def process_with_function_calling(message, user_input):
             conversation_history.setdefault(uid, []).append({"role": "user", "content": user_input})
             conversation_history[uid].append({"role": "assistant", "content": final})
             conversation_history[uid] = conversation_history[uid][-10:]
+            persist_memory()
     except Exception as e:
         await message.reply(f"❌ Error: {e}")
 
@@ -354,29 +368,32 @@ async def execute_function(fn, args, message):
 # ===== BACKGROUND TASKS =====
 
 async def memory_summary_task():
-    global DAILY_MEMORY
+    global DAILY_MEMORY, SUMMARIZED_AT
     await client.wait_until_ready()
     while not client.is_closed():
-        await asyncio.sleep(86400)
-        if conversation_history:
-            all_text = ""
-            for uid, h in conversation_history.items():
-                msgs = [m['content'] for m in h if m['role'] == 'user']
-                if msgs:
-                    all_text += f"User {uid}: " + " | ".join(msgs) + "\n"
-            if all_text.strip():
-                try:
-                    sr = await asyncio.to_thread(
-                        deepseek_client.chat.completions.create,
-                        model="deepseek-chat",
-                        messages=[{"role": "system", "content": "Summarize concisely."},
-                                  {"role": "user", "content": all_text}],
-                        stream=False
-                    )
-                    DAILY_MEMORY = sr.choices[0].message.content.strip()
-                    print("✅ Daily memory updated.")
-                except Exception as e:
-                    print(f"❌ Summary failed: {e}")
+        await asyncio.sleep(3600)  # check hourly; summarize at most once per 24h, even across restarts
+        if time.time() - SUMMARIZED_AT < 86400 or not conversation_history:
+            continue
+        all_text = ""
+        for uid, h in conversation_history.items():
+            msgs = [m['content'] for m in h if m['role'] == 'user']
+            if msgs:
+                all_text += f"User {uid}: " + " | ".join(msgs) + "\n"
+        if all_text.strip():
+            try:
+                sr = await asyncio.to_thread(
+                    deepseek_client.chat.completions.create,
+                    model="deepseek-chat",
+                    messages=[{"role": "system", "content": "Summarize concisely."},
+                              {"role": "user", "content": all_text}],
+                    stream=False
+                )
+                DAILY_MEMORY = sr.choices[0].message.content.strip()
+                SUMMARIZED_AT = time.time()
+                persist_memory()
+                print("✅ Daily memory updated.")
+            except Exception as e:
+                print(f"❌ Summary failed: {e}")
 
 async def system_monitor_task():
     await client.wait_until_ready()
@@ -432,20 +449,19 @@ async def on_message(message):
 
     now = asyncio.get_running_loop().time()
     
-    # Confirmation flow
-    if message.author.id in pending_confirmations:
-        if now > pending_confirmations[message.author.id]["expires"]:
-            del pending_confirmations[message.author.id]
-            await message.reply("⚠️ Confirmation expired.")
-            return
-        if message.content.strip().upper() == "YES":
-            cmd = pending_confirmations.pop(message.author.id)["command"]
-            ok, msg = await send_to_worker(cmd)
+    # Confirmation flow (one-shot: any reply, YES or not, consumes the pending request)
+    pending = pending_confirmations.pop(message.author.id, None)
+    if pending:
+        action, handled = resolve_confirmation(pending, message.content, now)
+        if action == "execute":
+            ok, msg = await send_to_worker(pending["command"])
             await message.reply(f"{'✅' if ok else '❌'} {msg}")
-        else:
-            del pending_confirmations[message.author.id]
+        elif action == "expired":
+            await message.reply("⚠️ Confirmation expired. Ask again.")
+        elif action == "cancelled":
             await message.reply("❌ Cancelled.")
-        return
+        if handled:
+            return
 
     user_input = None
     if message.attachments and whisper_model:

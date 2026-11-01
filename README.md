@@ -1,122 +1,165 @@
-# Jarvis: Personal AI Assistant
+# Jarvis
 
-A self-hosted personal assistant you control from Discord. A **brain** (home server) talks to a **worker** (laptop) over a private **Tailscale** network and uses **DeepSeek** for natural-language understanding and function calling.
+[![CI](https://github.com/G13B13/Jarvis/actions/workflows/ci.yml/badge.svg)](https://github.com/G13B13/Jarvis/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Built for personal use: open apps, manage files, set reminders, control system settings and more, by text or voice memo.
+A self-hosted personal assistant you control from Discord, by text or voice memo.
+A **brain** on a home server understands what you say (DeepSeek function calling + local Whisper) and tells a **worker** on your laptop what to do, over a private Tailscale network. The worker can only run a fixed allowlist of actions.
 
+<!-- Add a screenshot or GIF at docs/demo.png, then uncomment the next line:
+![Jarvis in Discord](docs/demo.png)
+-->
+
+## How it works
+
+```mermaid
+flowchart LR
+    You["You: Discord text or voice memo"] --> Brain
+
+    subgraph home["Home server (Proxmox LXC)"]
+        Brain["Brain: Jarvis_brain.py"]
+        Brain --> LLM["DeepSeek: function calling"]
+        Brain --> Whisper["faster-whisper: local speech to text"]
+        Brain --> Store[("SQLite reminders + memory.json")]
+    end
+
+    Brain -- "HTTP over Tailscale + API key" --> Worker
+
+    subgraph laptop["Laptop"]
+        Worker["Worker: worker.py"] --> Actions["Allowlisted commands, file transfer, status"]
+    end
 ```
- You (Discord) ──► Brain (home server)                 Worker (laptop)
-                   Jarvis_brain.py  ── Tailscale ──►   worker.py (Flask/waitress)
-                   ├─ DeepSeek (function calling)      ├─ allowlisted commands only
-                   ├─ faster-whisper (voice memos)     ├─ file get/save (allowed dirs)
-                   └─ SQLite reminders                 └─ status, screenshot
-```
+
+1. You send `j open spotify`, or a voice message, in Discord. Only your Discord user ID is obeyed.
+2. Exact short commands (`status`, `volume 40`, `shutdown laptop`) are handled directly. Anything else goes to DeepSeek, which can only call a small set of tools.
+3. The brain sends a named command to the worker, with a secret key, over Tailscale.
+4. The worker checks the key, looks the command up in its allowlist and runs it.
 
 ## Features
 
-- **Chat:** natural language via DeepSeek function calling; `jarvis ...` or `j ...` prefix; only your Discord user ID is obeyed.
-- **Voice memos:** send a Discord voice message, it's transcribed locally with faster-whisper and executed.
-- **Laptop control:** launch apps, open sites, Google/YouTube search, volume, brightness, Wi-Fi, Bluetooth, screenshots, sleep/shutdown/reboot (with `YES` confirmation).
-- **Files:** pull a file from the laptop into Discord (`j send me ~/Documents/report.pdf`), push an attachment to `~/Downloads`. 8 MB limit.
-- **Reminders:** `j remind me to call mom in 30 minutes` (SQLite-backed).
-- **Automation:** 07:00 daily briefing (weather, laptop status), low-battery alerts, daily conversation summary.
+- **Natural language and voice:** talk to it normally, or send a Discord voice message, which is transcribed locally with faster-whisper.
+- **Laptop control:** launch apps and sites, search, volume, brightness, Wi-Fi, Bluetooth, screenshots, sleep/shutdown/reboot.
+- **Files:** pull a file from the laptop into Discord, or push an attachment to `~/Downloads` (8 MB limit).
+- **Reminders:** `j remind me to call mom in 30 minutes`, stored in SQLite and delivered in Discord.
+- **Automation:** 07:00 daily briefing (weather and laptop status), low-battery alerts, daily conversation summary.
+- **Memory that survives restarts:** recent conversation and the daily summary are saved to `memory.json`.
 
-## Status
+## Commands
 
-| Working | In progress / not in this repo yet |
+| You type | What happens |
 |---|---|
-| Text + voice commands, function calling | Robot arm server (`robot_server.py`, PCA9685 + Arduino): works locally, not published yet |
-| File transfer, screenshots, system control | Camera object detection |
-| Reminders, briefing, battery alerts | Google Meet creation (planned) |
+| `j status` | CPU, RAM, disk, battery and uptime of the laptop |
+| `j open firefox` / `j open calculator` | Launches the app |
+| `j search youtube for lo-fi` | Opens the search in Firefox |
+| `j volume 40`, `j volume up`, `j mute` | Audio control (0-100) |
+| `j send me ~/Documents/report.pdf` | Uploads the file to Discord |
+| *(attach a file)* `j save this` | Saves the attachment to `~/Downloads` |
+| `j remind me to call mom in 30 minutes` | Creates a reminder (`in ...`, `at 3pm`, `tomorrow 9am`) |
+| `j shutdown laptop` | Asks for confirmation. Reply `YES` within 30 seconds |
+| `j I want to watch some videos` | The LLM decides what to do |
 
-Known limitation: Discord voice-channel wake word was dropped (unstable `discord-ext-voice-recv`). Voice memos are the reliable alternative.
+## Security model
 
-Planned: ESP32 push-to-talk node, multi-worker support, persistent conversation memory.
+The worker can run commands on a real laptop, so most of the engineering went into limiting what it will accept. Each row below is covered by an automated test.
 
-## Repo layout
+| Risk | Mitigation |
+|---|---|
+| Anyone on the network calls the worker | Every route needs `X-API-Key`, compared in constant time. The secret lives in `.env`, never in source |
+| Worker exposed on the LAN | Binds to the Tailscale IP only (`WORKER_BIND`), never `0.0.0.0` |
+| Arbitrary command execution | `/execute` only runs names from a fixed allowlist, as argument lists. No shell, no arbitrary program names |
+| Injection through arguments | Search text is URL-encoded, volume and brightness are parsed as integers and clamped |
+| Reading secrets off the laptop | `/get_file` only reads inside `WORKER_ALLOWED_DIRS`, resolves symlinks and `..`, and refuses dotfiles (`.ssh`, `.env`) |
+| Overwriting or escaping on upload | `/save_file` strips paths, never overwrites and caps the size |
+| The LLM doing something destructive | The LLM's tool list has no power commands. Sleep, shutdown and reboot are only reachable through exact commands plus a one-shot `YES` that expires in 30 seconds |
+| Leaked credentials | `.env` is gitignored, `.env.example` has placeholders only, and history is scanned before publishing |
 
-```
-Jarvis_brain.py        Discord bot + DeepSeek function calling (brain host)
-reminders.py           SQLite reminders + time parsing
-worker.py              Laptop API (worker host)
-services/              systemd units for brain and worker
-tests/                 pytest suite (worker security + reminder parsing)
-requirements-brain.txt / requirements-worker.txt / requirements-dev.txt
-.env.example
-```
+## Quick start
 
-## Setup
+You need two machines on one [Tailscale](https://tailscale.com) network, a Discord bot token ([create one](https://discord.com/developers/applications), enable **Message Content Intent**) and a DeepSeek API key.
 
-You need two machines on one Tailscale network, a Discord bot token and a DeepSeek API key.
+### 1. Worker (the laptop)
 
-### 1. Discord bot
-Developer Portal → New Application → Bot → Reset Token. Enable **MESSAGE CONTENT INTENT**. Invite it with scopes `bot, applications.commands`.
-
-### 2. Tailscale on both machines
-```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
-tailscale ip -4        # note each machine's IP
-```
-
-### 3. Worker (laptop)
 ```bash
 sudo apt install xclip pulseaudio-utils brightnessctl network-manager rfkill scrot
 git clone https://github.com/G13B13/Jarvis.git ~/jarvis-worker && cd ~/jarvis-worker
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements-worker.txt
-cp .env.example .env && chmod 600 .env   # set WORKER_SECRET, WORKER_BIND (laptop's Tailscale IP)
-python worker.py                         # test run
+cp .env.example .env && chmod 600 .env     # set WORKER_SECRET and WORKER_BIND (tailscale ip -4)
+python worker.py                           # test run; Ctrl+C to stop
 ```
-Run it as a service: edit `YOUR_USERNAME` in `services/jarvis-worker.service`, then
-`sudo cp services/jarvis-worker.service /etc/systemd/system/ && sudo systemctl enable --now jarvis-worker`.
 
-### 4. Brain (home server)
+To run it as a service, edit `YOUR_USERNAME` in `services/jarvis-worker.service`, then:
+
+```bash
+sudo cp services/jarvis-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now jarvis-worker
+```
+
+### 2. Brain (the home server)
+
 ```bash
 sudo apt install ffmpeg
 sudo useradd --system --home /opt/jarvis --shell /usr/sbin/nologin jarvis
 sudo git clone https://github.com/G13B13/Jarvis.git /opt/jarvis && cd /opt/jarvis
 sudo python3 -m venv venv && sudo venv/bin/pip install -r requirements-brain.txt
-sudo cp .env.example .env    # set DISCORD_TOKEN, DEEPSEEK_API_KEY, WORKER_SECRET, YOUR_DISCORD_USER_ID, WORKER_URL
+sudo cp .env.example .env        # set DISCORD_TOKEN, DEEPSEEK_API_KEY, WORKER_SECRET, YOUR_DISCORD_USER_ID, WORKER_URL
 sudo chown -R jarvis:jarvis /opt/jarvis && sudo chmod 600 /opt/jarvis/.env
-sudo cp services/jarvis-brain.service /etc/systemd/system/ && sudo systemctl enable --now jarvis-brain
+sudo cp services/jarvis-brain.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now jarvis-brain
+journalctl -u jarvis-brain -f
 ```
-`WORKER_SECRET` must be identical on both machines.
 
-## Usage
+`WORKER_SECRET` must be identical on both machines. Generate one with `openssl rand -hex 32`.
 
-```
-j hello
-j open firefox
-j status
-j send me ~/Documents/report.pdf
-j remind me to call mom in 30 minutes
-j volume 40
-j search youtube for lo-fi
-j shutdown laptop        (asks for YES)
-j I want to watch some videos     -> LLM decides (opens YouTube)
-```
-Exact short commands are handled directly; anything else goes to DeepSeek.
+If the brain runs in an unprivileged LXC container and the service fails with `status=226/NAMESPACE`, remove the `ProtectSystem`, `ProtectHome` and `PrivateTmp` lines from the unit, or enable nesting for the container.
 
-## Security model
+## Configuration
 
-- Worker routes all require `X-API-Key` (constant-time comparison); the secret lives in `.env`, never in source.
-- `/execute` runs only commands from a fixed allowlist as argv lists. No shell, no arbitrary programs. User input is validated or URL-encoded.
-- `/get_file` only reads inside `WORKER_ALLOWED_DIRS` (default `~/Documents`, `~/Downloads`), resolves symlinks and `..`, and refuses dotfiles (`.ssh`, `.env`, ...).
-- The worker binds to the Tailscale IP only, never `0.0.0.0`.
-- The brain obeys a single Discord user ID and runs as an unprivileged systemd user with `NoNewPrivileges` and a read-only filesystem except its own directory.
-- `.env` is gitignored. If a key ever lands in a commit, rotate it. Deleting the commit is not enough.
+| Variable | Used by | Purpose |
+|---|---|---|
+| `WORKER_SECRET` | both | Shared API key. Must match |
+| `DISCORD_TOKEN`, `DEEPSEEK_API_KEY` | brain | Credentials |
+| `YOUR_DISCORD_USER_ID` | brain | The only user the bot obeys |
+| `WORKER_URL`, `ROBOT_URL` | brain | Worker `/execute` URL and optional robot server |
+| `MEMORY_PATH` | brain | Where chat memory is saved (default `memory.json` next to the code) |
+| `WORKER_BIND`, `WORKER_PORT` | worker | Tailscale IP and port to listen on |
+| `WORKER_ALLOWED_DIRS` | worker | Folders `send me` may read (default `~/Documents,~/Downloads`) |
 
-## Tests
+## Development
 
 ```bash
-pip install -r requirements-dev.txt && python -m pytest -q tests
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements-dev.txt
+python -m pytest -q tests
 ```
+
+CI runs the same tests plus a lint for syntax errors and undefined names on every push. The tests cover the worker's security properties (auth, allowlist, path traversal, symlink escape, input handling), reminder time parsing, the confirmation flow and memory persistence.
+
+```
+Jarvis_brain.py       Discord bot and DeepSeek function calling
+confirmation.py       YES-to-confirm decision logic (unit-tested)
+memory_store.py       Atomic JSON persistence for chat memory (unit-tested)
+reminders.py          SQLite reminders and time parsing
+worker.py             Laptop API
+services/             systemd units for brain and worker
+tests/                pytest suite
+```
+
+## Status and roadmap
+
+| Working | Not in this repo yet |
+|---|---|
+| Text and voice commands, function calling | Robot arm server (PCA9685 + Arduino): works locally, not published |
+| File transfer, screenshots, system control | Camera object detection |
+| Reminders, briefing, battery alerts, persistent memory | Google Meet creation (planned) |
+
+Known limitation: the Discord voice-channel wake word was dropped because the voice-receive extension was unstable. Voice memos are the reliable path. Planned: an ESP32 push-to-talk node and multi-worker support.
 
 ## Tech stack
 
-discord.py · DeepSeek (OpenAI-compatible SDK) · faster-whisper · Flask + waitress · SQLite · APScheduler · Tailscale · systemd
+discord.py, DeepSeek (OpenAI-compatible SDK), faster-whisper, Flask + waitress, SQLite, APScheduler, Tailscale, systemd, GitHub Actions.
 
 ## License
 
-MIT, see `LICENSE`.
+MIT. See [LICENSE](LICENSE).

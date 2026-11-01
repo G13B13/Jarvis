@@ -1,5 +1,9 @@
 venv/
 .env
 reminders.db
+memory.json
+.memory-*.tmp
+.cache/
 __pycache__/
 *.pyc
+.pytest_cache/
